@@ -27,7 +27,7 @@ app = Flask(__name__)
 # 1. CORE PIPELINE COMPONENTS
 # =====================================================================
 class SpecSchema(BaseModel):
-    document_content: list[str] = Field(description="A highly detailed 20-point corporate architecture breakdown.")
+    document_content: list[str] = Field(description="7 to 10 short, crisp, highly technical bullet points summarizing the system. Max 1 sentence per point. Do not invent fluff.")
     diagram_code: str = Field(description="Flawless Mermaid.js architecture diagram syntax mapping the system.")
 
 class DocSection(BaseModel):
@@ -42,21 +42,55 @@ class DirectoryGroup(BaseModel):
     group_name: str = Field(description="A short label for this group, e.g. 'Core Application & Server' or the directory name itself.")
     files: list[FileEntry]
 
+class WhyBenefit(BaseModel):
+    benefit: str = Field(description="A short benefit name, 2-5 words, e.g. 'Faster Onboarding' or 'Reduced Manual Work'.")
+    description: str = Field(description="One plain-English sentence explaining the benefit itself.")
+    business_impact: str = Field(description="One plain-English sentence on the concrete business or team impact.")
+
 class DeepDocSchema(BaseModel):
     project_name: str = Field(description="The project/system's name, inferred from the repo (folder name, README title, or package name).")
-    overview: str = Field(description="4-6 sentences: what this codebase is, its primary purpose, and its core technical approach.")
-    execution_flow: list[str] = Field(description="4-8 ordered steps describing the end-to-end execution flow, each a full sentence or two, in the actual order things happen.")
-    sections: list[DocSection] = Field(description="6-10 thematic sections (e.g. Data Layer, API Layer, Feature Pipeline) each with a heading and explanatory paragraph.")
+
+    what_is_it: str = Field(description=(
+        "2-4 sentences written for a smart, non-technical reader -- a PM or stakeholder, not an "
+        "engineer. Plain, warm, professional language. Define what this system actually is and does "
+        "in everyday terms before naming any technology. A simple analogy is welcome if it genuinely "
+        "helps ('Think of it as...'). No jargon, no acronyms without immediately explaining them."
+    ))
+    why_it_matters: list[WhyBenefit] = Field(description=(
+        "3-5 real benefits this system provides, inferred honestly from what the code actually does "
+        "-- not generic filler. Each needs a short benefit name, a one-sentence description, and a "
+        "one-sentence business impact."
+    ))
+    what_we_do: list[str] = Field(description=(
+        "5-9 ordered steps explaining what actually happens, end to end, written the way you'd "
+        "explain it out loud to a smart colleague who isn't an engineer -- not the way you'd write "
+        "a technical spec. Each step should read as a full, natural sentence or two. You may "
+        "reference a real filename or technology in passing, but always explain what it does in "
+        "plain terms rather than assuming the reader knows it. Avoid starting every step with "
+        "'Step N:' -- vary the phrasing naturally, the way the example document does."
+    ))
+    closing_note: str = Field(description=(
+        "Optional: 1-2 sentences on reliability, a recent improvement, or a reassuring summary "
+        "takeaway, in the same warm plain-English voice (e.g. 'no request is ever silently "
+        "dropped'). Leave as an empty string if there's nothing genuine to say here -- never invent "
+        "a fake reliability claim."
+    ))
+
+    # Technical appendix -- kept for engineers who want to go deeper, rendered after the narrative
+    execution_flow: list[str] = Field(description="4-8 technically precise ordered steps for an engineering audience -- filenames, functions, real technical detail. This is the technical mirror of what_we_do, not a repeat of it.")
+    sections: list[DocSection] = Field(description="6-10 thematic technical sections (e.g. Data Layer, API Layer) each with a heading and explanatory paragraph, for engineers.")
     file_breakdown: list[DirectoryGroup] = Field(description="Every meaningfully analyzed file, grouped by its directory/module, each with a short description of what it does.")
     use_cases: list[str] = Field(description="3-6 real-world use cases this system enables for the people who'd use it.")
 
 def sanitize_mermaid(code: str) -> str:
     """Cleans up LLM syntax layout anomalies and guarantees valid Mermaid structure spacing."""
-    # Strip any markdown code block wrappers if included
     code = code.replace("```mermaid", "").replace("```", "").strip()
 
     # Force an explicit newline if the model merged flowchart layout and subgraph together
     code = re.sub(r'(flowchart\s+[A-Z]{2})\s+(subgraph)', r'\1\n\2', code, flags=re.IGNORECASE)
+
+    # NEW FIX: Force a newline if Gemini puts a node on the exact same line as the subgraph declaration
+    code = re.sub(r'(subgraph\s+\w+(?:\s+\[.*?\])?)\s+(\w)', r'\1\n\2', code, flags=re.IGNORECASE)
 
     # Guarantee newlines before structural boundary keyword tags
     code = re.sub(r'(\S)\s+(subgraph|end\b)', r'\1\n\2', code, flags=re.IGNORECASE)
@@ -67,7 +101,6 @@ def sanitize_mermaid(code: str) -> str:
         line_str = line.strip()
         if not line_str:
             continue
-        # Strip trailing hanging link symbols with missing destinations
         if re.search(r'(-->|--x|--o|-\.->)\s*$', line_str):
             continue
         cleaned.append(line)
@@ -141,7 +174,10 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
                        parent_folder_id: str = None, logo_path: str = None,
                        overview: str = None, execution_flow: list = None,
                        file_breakdown: list = None, use_cases: list = None,
-                       github_base_url: str = None) -> str:
+                       github_base_url: str = None,
+                       what_is_it: str = None, why_it_matters: list = None,
+                       what_we_do: list = None, closing_note: str = None,
+                       project_name: str = None) -> str:
     """Creates a formatted Google Doc: cover page (title/subtitle/author/date with
     yellow highlight + horizontal rule, matching the company template) followed by
     content pages using Heading 2 / Body text styles in Figtree, round bullets,
@@ -160,7 +196,6 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
     date_str = datetime.now().strftime("%d %B %Y")
 
     # ---------- 1. COVER PAGE TEXT ----------
-    # Blank lines push the title block down the page, matching the template's layout.
     cover_lead_in = "\n" * 8
     cover_parts = [cover_lead_in, f"{title}\n", f"{subtitle}\n", f"{author_name}\n", f"{date_str}\n\n"]
     cover_text = "".join(cover_parts)
@@ -170,7 +205,6 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
         body={'requests': [{'insertText': {'location': {'index': 1}, 'text': cover_text}}]}
     ).execute()
 
-    # Compute offsets within cover_text for each styled line
     lead_len = len(cover_lead_in)
     title_start = lead_len
     title_end = title_start + len(title)
@@ -182,7 +216,6 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
     date_end = date_start + len(date_str)
 
     cover_style_requests = [
-        # Title: large, bold, yellow-highlighted
         {'updateTextStyle': {
             'range': {'startIndex': 1 + title_start, 'endIndex': 1 + title_end},
             'textStyle': {
@@ -192,7 +225,6 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
             },
             'fields': 'fontSize,weightedFontFamily,backgroundColor'
         }},
-        # Subtitle: bold, smaller, yellow-highlighted
         {'updateTextStyle': {
             'range': {'startIndex': 1 + subtitle_start, 'endIndex': 1 + subtitle_end},
             'textStyle': {
@@ -202,7 +234,6 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
             },
             'fields': 'bold,fontSize,weightedFontFamily,backgroundColor'
         }},
-        # Author + date: small, yellow-highlighted
         {'updateTextStyle': {
             'range': {'startIndex': 1 + author_start, 'endIndex': 1 + date_end},
             'textStyle': {
@@ -212,7 +243,6 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
             },
             'fields': 'fontSize,weightedFontFamily,backgroundColor'
         }},
-        # Horizontal rule above the title (border on the blank line just before it)
         {'updateParagraphStyle': {
             'range': {'startIndex': 1 + title_start - 1, 'endIndex': 1 + title_start},
             'paragraphStyle': {'borderBottom': {
@@ -221,7 +251,6 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
             }},
             'fields': 'borderBottom'
         }},
-        # Horizontal rule under the subtitle
         {'updateParagraphStyle': {
             'range': {'startIndex': 1 + subtitle_start, 'endIndex': 1 + subtitle_end},
             'paragraphStyle': {'borderBottom': {
@@ -241,9 +270,8 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
     ).execute()
     content_start_index = cover_end_index + 1
 
-    # ---------- 3. CONTENT: build as tagged blocks so each part (headings, numbered
-    # steps, hyperlinked file paths, bullets) can get its own formatting pass afterward ----------
-    blocks = []  # each: {'type': ..., 'start': int, 'end': int, 'link_start': int, 'link_end': int}
+    # ---------- 3. CONTENT: build as tagged blocks ----------
+    blocks = []
     text_parts = []
     cursor = 0
 
@@ -254,13 +282,41 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
         cursor += len(text)
         blocks.append({'type': block_type, 'start': start, 'end': cursor - (1 if is_paragraph_end else 0)})
 
-    if overview:
-        add_block("Overview\n", 'h1')
-        add_block(f"{overview}\n\n", 'body')
+    if what_is_it:
+        add_block(f"What is {project_name or title}?\n", 'h1')
+        add_block(f"{what_is_it}\n\n", 'body')
+
+    if why_it_matters:
+        add_block("Why It Matters\n", 'h1')
+        for item in why_it_matters:
+            benefit = (item.get('benefit') or '').strip()
+            desc = (item.get('description') or '').strip()
+            impact = (item.get('business_impact') or '').strip()
+            line = f"{benefit}: {desc} {impact}\n"
+            start = cursor
+            text_parts.append(line)
+            cursor += len(line)
+            blocks.append({
+                'type': 'benefit_item', 'start': start, 'end': cursor - 1,
+                'bold_start': start, 'bold_end': start + len(benefit) + 1
+            })
+        add_block("\n", 'spacer', is_paragraph_end=False)
+
+    if what_we_do:
+        add_block("What We Do\n", 'h1')
+        for step in what_we_do:
+            add_block(f"{step.strip()}\n", 'numbered_item')
+        add_block("\n", 'spacer', is_paragraph_end=False)
+
+    if closing_note and closing_note.strip():
+        add_block(f"{closing_note.strip()}\n\n", 'body_italic')
+
+    if execution_flow or sections or file_breakdown or use_cases:
+        add_block("Technical Appendix\n", 'h1')
+        add_block("The section below is a deeper technical reference for engineers. Everything above already covers what this system is and why it matters.\n\n", 'body_italic')
 
     if execution_flow:
-        add_block("End-to-End Execution Flow\n", 'h1')
-        flow_start_block_index = len(blocks)
+        add_block("End-to-End Execution Flow\n", 'h2')
         for step in execution_flow:
             add_block(f"{step.strip()}\n", 'numbered_item')
         add_block("\n", 'spacer', is_paragraph_end=False)
@@ -274,7 +330,7 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
         add_block(f"{body}\n\n", 'body')
 
     if file_breakdown:
-        add_block("File-by-File Breakdown\n", 'h1')
+        add_block("File-by-File Breakdown\n", 'h2')
         for group in file_breakdown:
             group_name = (group.get('group_name') or '').strip()
             if group_name:
@@ -294,7 +350,7 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
         add_block("\n", 'spacer', is_paragraph_end=False)
 
     if use_cases:
-        add_block("What This Enables\n", 'h1')
+        add_block("What This Enables\n", 'h2')
         for uc in use_cases:
             add_block(f"{uc.strip()}\n", 'bullet_item')
 
@@ -304,7 +360,6 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
         body={'requests': [{'insertText': {'location': {'index': content_start_index}, 'text': content_text}}]}
     ).execute()
 
-    # Base styling: Figtree body text, 12pt, 1.5 line spacing, across all content
     content_style_requests = [
         {'updateTextStyle': {
             'range': {'startIndex': content_start_index, 'endIndex': content_start_index + len(content_text)},
@@ -333,6 +388,18 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
                 'textStyle': {'bold': True, 'fontSize': {'magnitude': 14, 'unit': 'PT'}, 'weightedFontFamily': {'fontFamily': FIGTREE, 'weight': 600}},
                 'fields': 'bold,fontSize,weightedFontFamily'
             }})
+        elif block['type'] == 'benefit_item':
+            content_style_requests.append({'updateTextStyle': {
+                'range': {'startIndex': content_start_index + block['bold_start'], 'endIndex': content_start_index + block['bold_end']},
+                'textStyle': {'bold': True},
+                'fields': 'bold'
+            }})
+        elif block['type'] == 'body_italic':
+            content_style_requests.append({'updateTextStyle': {
+                'range': {'startIndex': abs_start, 'endIndex': abs_end},
+                'textStyle': {'italic': True},
+                'fields': 'italic'
+            }})
         elif block['type'] == 'file_item' and block.get('url'):
             content_style_requests.append({'updateTextStyle': {
                 'range': {'startIndex': content_start_index + block['link_start'], 'endIndex': content_start_index + block['link_end']},
@@ -341,7 +408,6 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
             }})
     docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': content_style_requests}).execute()
 
-    # Bullet/numbering pass -- group contiguous same-type items into single ranges
     def contiguous_ranges(item_type):
         items = [b for b in blocks if b['type'] == item_type]
         ranges = []
@@ -368,14 +434,15 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
             'range': {'startIndex': content_start_index + r_start, 'endIndex': content_start_index + r_end},
             'bulletPreset': 'BULLET_DISC_CIRCLE_SQUARE'
         }})
+    for (r_start, r_end) in contiguous_ranges('benefit_item'):
+        list_requests.append({'createParagraphBullets': {
+            'range': {'startIndex': content_start_index + r_start, 'endIndex': content_start_index + r_end},
+            'bulletPreset': 'BULLET_DISC_CIRCLE_SQUARE'
+        }})
     if list_requests:
         docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': list_requests}).execute()
 
     # ---------- 4. DIAGRAM IMAGE ----------
-    # Note: diagram_url was already validated as a real image when it was generated
-    # (in open_source_diagram_generator_tool) -- we deliberately don't re-check it
-    # here, since a second round-trip to Kroki's free public server just doubles
-    # exposure to transient flakiness for a URL that was already confirmed good.
     if diagram_url:
         doc_now = docs_service.documents().get(documentId=doc_id, fields='body.content').execute()
         end_index = doc_now['body']['content'][-1]['endIndex'] - 1
@@ -392,7 +459,7 @@ def create_google_doc(credentials, title: str, sections: list, diagram_url: str,
             print(f"⚠️ Diagram image insert failed, Doc created without it: {image_error}")
             sys.stdout.flush()
 
-    # ---------- 5. HEADER LOGO + FOOTER (repeat on every page) ----------
+    # ---------- 5. HEADER LOGO + FOOTER ----------
     try:
         header_footer = docs_service.documents().batchUpdate(
             documentId=doc_id,
@@ -447,14 +514,8 @@ def open_source_diagram_generator_tool(mermaid_code: str) -> str:
     """Generates a compressed live Mermaid image URL using Kroki to stay safely under the 2KB Google API limit."""
     try:
         clean_code = sanitize_mermaid(mermaid_code)
-
-        # Compress the text using zlib deflate (Level 9 max compression)
         compressed_data = zlib.compress(clean_code.encode('utf-8'), level=9)
-
-        # Encode using URL-safe Base64 as required by the Kroki specification
         encoded_string = base64.urlsafe_b64encode(compressed_data).decode('utf-8')
-
-        # Route to Kroki's high-performance microservice to return a production-grade PNG
         return f"https://kroki.io/mermaid/png/{encoded_string}"
     except Exception as e:
         print(f"⚠️ Diagram tool compression failed: {e}")
@@ -469,37 +530,33 @@ class GitHubRateLimitError(Exception):
     pass
 
 class AuthenticatedRepoIngestor:
-    def __init__(self, pat_token: str, max_files: int = 400, max_total_chars: int = 600_000):
-        self.pat_token = pat_token
+    def __init__(self, personal_pat: str, company_pat: str, max_files: int = 400, max_total_chars: int = 600_000):
+        self.personal_pat = personal_pat
+        self.company_pat = company_pat
         self.IGNORED_DIRS = {
             'node_modules', '.git', '.github', 'venv', 'env', '__pycache__',
             '.pytest_cache', '.egg-info', 'dist', 'build', 'vendor', 'target',
             '.next', '.nuxt', 'coverage', '.venv'
         }
-        # Broadened beyond Python-only so this works reasonably well on any
-        # public repo's primary language, not just Python/config-heavy ones.
         self.ALLOWED_EXTENSIONS = {
             '.py', '.json', '.yaml', '.yml', '.md', '.txt', '.sh', 'Dockerfile',
             '.js', '.jsx', '.ts', '.tsx', '.go', '.java', '.rb', '.php', '.rs',
             '.c', '.cpp', '.h', '.hpp', '.cs', '.swift', '.kt', '.scala',
             '.sql', '.graphql', '.proto', '.toml', '.cfg', '.ini'
         }
-        # Pure noise even if the extension matches -- never useful for architecture understanding
         self.EXCLUDED_FILENAME_SUBSTRINGS = {
             '.min.js', '.min.css', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
             'poetry.lock', '.snap', '.generated.', '.pb.go'
         }
-        # Entry-point-ish filenames get ingested first, so if the budget runs out,
-        # what's cut is the least architecturally important content, not the most.
         self.PRIORITY_FILENAMES = {
             'readme.md', 'main.py', 'app.py', 'index.js', 'index.ts', 'main.go',
             'main.java', 'server.py', 'server.js', 'settings.py', 'config.py',
             'docker-compose.yml', 'dockerfile'
         }
         self.MAX_FILES = max_files
-        self.MAX_TOTAL_CHARS = max_total_chars  # conservative budget re: Gemini free-tier TPM
-        self.MAX_SINGLE_FILE_CHARS = 40_000      # one huge generated/vendored file can't eat the whole budget
-        self.PER_REQUEST_DELAY = 0.05            # small delay between per-file fetches to avoid GitHub's secondary abuse-rate limit
+        self.MAX_TOTAL_CHARS = max_total_chars
+        self.MAX_SINGLE_FILE_CHARS = 40_000
+        self.PER_REQUEST_DELAY = 0.05
         self.last_repo_meta = None
 
     def _parse_url(self, url: str) -> dict:
@@ -508,8 +565,6 @@ class AuthenticatedRepoIngestor:
         return {"owner": match.group(1), "repo": match.group(2).replace(".git", "").split("/")[0]}
 
     def _check_rate_limit(self, response):
-        """Raises a clear, user-facing error if GitHub's primary or secondary
-        rate limit was hit, with an ETA computed from the response headers."""
         if response.status_code != 403:
             return
         remaining = response.headers.get("X-RateLimit-Remaining")
@@ -535,7 +590,15 @@ class AuthenticatedRepoIngestor:
 
     def compile_buffer(self, url: str) -> str:
         meta = self._parse_url(url)
-        headers = {"User-Agent": "DocAgent", "Authorization": f"token {self.pat_token}"}
+
+        if meta['owner'].lower() == 'mainaryanhoon':
+            active_pat = self.company_pat
+            print("🔐 Using Company PAT for Tatvic IP")
+        else:
+            active_pat = self.personal_pat
+            print("🔐 Using Personal PAT for Personal IP")
+
+        headers = {"User-Agent": "DocAgent", "Authorization": f"token {active_pat}"}
 
         with httpx.Client() as client:
             repo_res = client.get(f"https://api.github.com/repos/{meta['owner']}/{meta['repo']}", headers=headers)
@@ -554,7 +617,6 @@ class AuthenticatedRepoIngestor:
                 raise Exception("Failed to read repository file tree.")
             entries = tree_res.json().get("tree", [])
 
-            # Build candidate file list, filtered by extension/exclusions, priority files first
             candidates = []
             for item in entries:
                 path = item.get("path", "")
@@ -589,7 +651,7 @@ class AuthenticatedRepoIngestor:
                 try:
                     text = res.text
                 except Exception:
-                    continue  # binary or undecodable content -- skip rather than crash the whole run
+                    continue
 
                 if not text.strip():
                     continue
@@ -615,11 +677,12 @@ class AuthenticatedRepoIngestor:
 class ProductionDocOrchestrator:
     def __init__(self):
         self.client = genai.Client(api_key=os.environ.get("GEMINI_KEY"))
-        self.ingestor = AuthenticatedRepoIngestor(pat_token=os.environ.get("GITHUB_PAT"))
+        self.ingestor = AuthenticatedRepoIngestor(
+            personal_pat=os.environ.get("PERSONAL_GITHUB_PAT"),
+            company_pat=os.environ.get("COMPANY_GITHUB_PAT")
+        )
 
     def _generate_json(self, prompt: str, system_instruction: str, schema, max_output_tokens: int = 32768):
-        """Shared retry/repair logic for any Gemini structured-JSON call: handles
-        truncated JSON (retries) and transient 503 overload (backoff retries)."""
         parsed_output = None
         last_error = None
 
@@ -671,38 +734,39 @@ class ProductionDocOrchestrator:
         codebase_context = self.ingestor.compile_buffer(target_url)
 
         chat_system_instruction = """
-        You are a rigid production systems architect. Generate a unified, strictly factual infrastructure and application architecture diagram based on the parsed codebase context.
-        Absolutely no creative embellishments or non-existent components are allowed.
+        You are a rigid production systems architect.
+
+        TASK 1: Generate 7 to 10 short, crisp, highly technical bullet points summarizing the parsed codebase context ONLY. Assign these to the `document_content` array. Do NOT summarize the static hosting infrastructure below. Focus exclusively on the business logic, data flow, and files found in the uploaded repository text.
+
+        TASK 2: Generate a unified, strictly factual infrastructure and application architecture diagram.
 
         CRITICAL TOPOLOGY RULES FOR diagram_code (Must be completely valid inside a JSON string):
         1. Layout: Must start with `flowchart LR`.
 
         2. Static Hosting Infrastructure Block: You MUST include this exact subgraph structure at the beginning of the diagram.
-           CRITICAL: DO NOT USE QUOTES OF ANY KIND. Do not use punctuation or parentheses inside text labels.
-           subgraph Hosting_Infrastructure [GCP Production Infrastructure Cloud Run]
-               ChatUser[Google Chat Interface] -->|1 Async POST| WebhookEP[Cloud Run Webhook Endpoint]
-               WebhookEP -->|2 Check Idempotency| FirestoreDB[Firestore Cache]
-               WebhookEP -->|3 Offload Job| CloudTasks[Cloud Tasks Queue]
-               CloudTasks -->|4 Secure Trigger| WorkerEngine[Cloud Run Worker Engine]
-               WorkerEngine -->|5 Read Secrets| SecretManager[Google Secret Manager]
+           subgraph Hosting_Infrastructure [GCP Production Infrastructure]
+               ChatUser[Google Chat Interface] -->|Async POST| WebhookEP[Cloud Run Webhook]
+               WebhookEP -->|Check Idempotency| FirestoreDB[Firestore Cache]
+               WebhookEP -->|Offload Job| CloudTasks[Cloud Tasks Queue]
+               CloudTasks -->|Secure Trigger| WorkerEngine[Cloud Run Worker]
+               WorkerEngine -->|Read Secrets| SecretManager[Secret Manager]
            end
 
-        3. Dynamic Application Blocks: Extract the functional components from the scanned codebase context and group them into these three specific subgraphs (NO QUOTES):
+        3. Dynamic Application Blocks: Extract the functional components from the scanned codebase context and group them into these three specific subgraphs:
            - subgraph Ingestion_Tier [Application Ingestion Tier]
            - subgraph Processing_Tier [Application Processing Tier]
            - subgraph Delivery_Tier [Application Delivery Tier]
 
         4. Loop-Closure Connections: You MUST explicitly draw these structural edge routing links to bind the infrastructure to the application:
-           - Draw a connection from WorkerEngine to the initial code entry node inside Ingestion_Tier.
-           - Draw a connection from the final response node of Delivery_Tier back to ChatUser.
-           - Draw a connection from the final processing node of Delivery_Tier to a standalone node named GDoc[Google Workspace Doc Asset].
+           - WorkerEngine --> (initial code entry node inside Ingestion_Tier)
+           - (final response node of Delivery_Tier) --> ChatUser
+           - (final processing node of Delivery_Tier) --> GDoc[Google Workspace Doc]
 
-        5. Syntax & Compliance Restraints:
-           - Node IDs MUST start with a letter.
-           - Every single component declaration, statement, and connection step MUST be written on its own individual line.
-           - DO NOT USE QUOTES (single or double) anywhere in the diagram text.
-           - DO NOT USE parentheses (), braces {}, or special punctuation inside label brackets. Use clean alphanumeric characters and spaces only.
-           - Max 10 total logical nodes across the three application tiers combined to ensure scannability.
+        5. Strict Syntax Restraints (CRITICAL TO PREVENT RENDERING CRASHES):
+           - Node IDs MUST be simple alphanumeric strings with NO spaces or underscores (e.g., NodeA1).
+           - Node labels MUST NOT contain parentheses (), brackets [], braces {}, or quotes. Use simple alphanumeric text only.
+           - Every single component and connection MUST be written on its own individual line.
+           - Keep the dynamic application blocks to a maximum of 10 logical nodes combined.
         """
 
         parsed_output = self._generate_json(
@@ -723,42 +787,42 @@ class ProductionDocOrchestrator:
         }
 
     def generate_deep_doc_content(self, codebase_context: str) -> dict:
-        """Separate, dedicated Gemini call for the full-length Doc -- distinct from the
-        short Chat-card bullets. Asks for the same depth of output a manual agentic
-        code-exploration session would produce: an overview, an ordered execution flow,
-        thematic sections, and a file-by-file breakdown grouped by directory."""
         doc_system_instruction = """
-        You are a senior software architect producing a formal, deeply detailed architecture
-        document for engineers who were not involved in building this system -- the kind of
-        document a thorough manual code review would produce, not a shallow surface summary.
-        Write in full, clear prose. Reference actual filenames, function names, models, and
-        technologies found in the codebase context throughout -- never invent components that
-        aren't present in the code.
+        You write two very different things in one pass: a stakeholder-friendly narrative that
+        reads like a warm, professional internal memo, and a technical appendix for engineers.
+        Never let the two voices bleed into each other.
 
-        Produce ALL of the following:
+        THE NARRATIVE VOICE (what_is_it, why_it_matters, what_we_do, closing_note):
+        Write exactly like this real example, adapted to whatever this codebase actually does:
 
-        1. project_name: the system's actual name, inferred from the repo.
+        "In our business, a 'lead' is a potential customer who has shown active interest...
+        This is where Lead Scoring comes in. It is a smart filtering system that ranks every
+        single lead based on how likely they are to purchase from us. Think of it as an
+        automatic grading system..."
 
-        2. overview: 4-6 sentences on what this codebase is, its primary purpose, and its core
-           technical approach.
+        "1. We track what people do on our website. Every time someone visits... that activity
+        is captured through our website analytics. We know what pages they looked at..."
 
-        3. execution_flow: 4-8 ordered steps describing what actually happens end-to-end, in
-           the real order it happens, e.g. "Step 1: X uploads via Y, which is handled by Z.py"
-           -- specific, not generic.
+        "7. Recent update — every lead RE sends us is now guaranteed to come back scored.
+        Previously, a small number of leads could fall through... We've closed that gap..."
 
-        4. sections: 6-10 thematic sections (adapt names to what's actually present -- e.g. for
-           a data pipeline: Data Sources & Ingestion, Processing, Storage, API Layer, Caching,
-           Orchestration; for an ML/vision system: Feature Extraction, Model Inference, Synthesis
-           Layer). Each section: a clear heading and 2-4 full sentences of real explanation.
+        Match that register precisely: first person plural ("we"), short sentences, real-world
+        analogies before jargon, zero acronyms without an immediate plain-English explanation,
+        warm and confident rather than dry or academic. A smart 12-year-old should follow every
+        sentence in what_is_it, why_it_matters, and what_we_do without needing to ask what
+        anything means. Ground every claim in what the code actually does -- never invent
+        benefits or reliability claims that aren't genuinely supported by the codebase context.
 
-        5. file_breakdown: group EVERY meaningfully analyzed file by its directory/module. For
-           each file, 1-2 sentences on exactly what it does and why it matters -- not just a
-           restated filename. This should be as close to exhaustive as the codebase context
-           allows -- the goal is a genuine file-by-file map a new engineer could use to
-           navigate the repo, not a token summary.
+        THE TECHNICAL VOICE (execution_flow, sections, file_breakdown, use_cases):
+        Switch registers completely here. This is for engineers who were not involved in
+        building the system -- reference actual filenames, function names, models, and
+        technologies found in the codebase context throughout. Precise, dense, no hand-holding.
+        Never invent components that aren't present in the code. file_breakdown should be as
+        close to exhaustive as the codebase context allows -- a genuine file-by-file map, not a
+        token summary.
 
-        6. use_cases: 3-6 concrete real-world use cases this system enables for the people who'd
-           actually use it.
+        Produce project_name (the system's actual name, inferred from the repo) alongside both
+        voices.
         """
 
         parsed_output = self._generate_json(
@@ -774,12 +838,10 @@ class ProductionDocOrchestrator:
 # 4. BACKGROUND PROCESSING FUNCTION
 # =====================================================================
 def process_and_reply(target_repo: str, space_name: str, credentials_path: str, requester_name: str = "DocAgent"):
-    """Processes the request in the background and posts back via the Google Chat API."""
     try:
         print(f"🔄 Thread started for {target_repo}...")
         sys.stdout.flush()
 
-        # FIXED: plain scope URL, no Markdown link wrapping
         credentials = service_account.Credentials.from_service_account_file(
             credentials_path, scopes=CHAT_SCOPES
         )
@@ -787,7 +849,6 @@ def process_and_reply(target_repo: str, space_name: str, credentials_path: str, 
 
         repo_name = target_repo.split('/')[-1].replace('.git', '')
 
-        # Send initial confirmation message inside the background worker
         chat_service.spaces().messages().create(
             parent=space_name,
             body={"text": f"⏳ I am compiling the codebase for `{repo_name}`. Generating blueprint..."}
@@ -800,9 +861,8 @@ def process_and_reply(target_repo: str, space_name: str, credentials_path: str, 
 
         bullet_points = "<br>".join([f"• {point}" for point in results['document']])
 
-        # Try to create a formatted Google Doc using user context credentials.
-        # The Doc gets its own dedicated, deeper generation pass -- not the same
-        # short bullets used in the Chat card -- so it reads like a real document.
+        valid_image = is_valid_image_url(results['image_url'])
+
         doc_url = None
         try:
             user_credentials = get_user_credentials()
@@ -816,15 +876,19 @@ def process_and_reply(target_repo: str, space_name: str, credentials_path: str, 
             doc_url = create_google_doc(
                 user_credentials,
                 title=deep_content.get('project_name') or repo_name,
+                project_name=deep_content.get('project_name') or repo_name,
                 subtitle="Architecture Blueprint",
                 author_name=requester_name,
+                what_is_it=deep_content.get('what_is_it'),
+                why_it_matters=deep_content.get('why_it_matters', []),
+                what_we_do=deep_content.get('what_we_do', []),
+                closing_note=deep_content.get('closing_note'),
                 sections=deep_content.get('sections', []),
-                overview=deep_content.get('overview'),
                 execution_flow=deep_content.get('execution_flow', []),
                 file_breakdown=deep_content.get('file_breakdown', []),
                 use_cases=deep_content.get('use_cases', []),
                 github_base_url=github_base_url,
-                diagram_url=results['image_url']
+                diagram_url=results['image_url'] if valid_image else None
             )
             print(f"📄 Google Doc successfully created: {doc_url}")
             sys.stdout.flush()
@@ -841,8 +905,10 @@ def process_and_reply(target_repo: str, space_name: str, credentials_path: str, 
         card_sections = [
             {"widgets": [{"textParagraph": {"text": f"<b>System Specifications:</b><br>{bullet_points}"}}]}
         ]
-        if results['image_url']:
+
+        if valid_image and results['image_url']:
             card_sections.append({"widgets": [{"image": {"imageUrl": results['image_url'], "altText": "Architecture Map"}}]})
+
         if buttons:
             card_sections.append({"widgets": [{"buttonList": {"buttons": buttons}}]})
 
@@ -870,7 +936,6 @@ def process_and_reply(target_repo: str, space_name: str, credentials_path: str, 
         print(f"❌ Background error: {e}")
         sys.stdout.flush()
         try:
-            # FIXED: plain scope URL, no Markdown link wrapping
             credentials = service_account.Credentials.from_service_account_file(
                 credentials_path, scopes=CHAT_SCOPES
             )
@@ -894,12 +959,10 @@ def google_chat_webhook():
         sys.stdout.flush()
         return jsonify({})
 
-    # Clean Logging: Drops the heavy authorization payload to keep the terminal readable
     clean_event = {k: v for k, v in event.items() if k != 'authorizationEventObject'}
     print(f"📬 Incoming Event Payload: {json.dumps(clean_event)}")
     sys.stdout.flush()
 
-    # Safely extracting variables from the nested modern Google schema layout
     chat_obj = event.get('chat', {})
     message_payload = chat_obj.get('messagePayload', {})
     message_obj = message_payload.get('message', {})
@@ -908,7 +971,6 @@ def google_chat_webhook():
     space_name = message_payload.get('space', {}).get('name', '')
     sender_name = message_obj.get('sender', {}).get('displayName', 'DocAgent')
 
-    # Upgraded Regex: Clean extraction that discards hidden markdown angle brackets if present
     url_match = re.search(r'https://github\.com/[a-zA-Z0-9_\.\-]+/[a-zA-Z0-9_\.\-]+', user_text)
 
     if url_match:
@@ -923,11 +985,9 @@ def google_chat_webhook():
             sys.stdout.flush()
             return jsonify({"text": "❌ Internal Bot Error: Missing server credentials key."})
 
-        # Launch non-blocking background worker thread
         thread = threading.Thread(target=process_and_reply, args=(target_repo, space_name, credentials_path, sender_name))
         thread.start()
 
-        # Returning a clean 200 OK empty object eliminates the "not responding" ghost banner
         return jsonify({})
 
     print(f"❓ Regex missed. Text received: '{user_text}'")
